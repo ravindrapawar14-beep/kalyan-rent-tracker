@@ -27,11 +27,11 @@ jobs:
         run: |
           python3 rent_tracker.py
 
-      - name: Save State to GitHub
+      - name: Commit and Push State Safely
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add seen_listings.json
-          git commit -m "Update seen rentals state [skip ci]" || echo "No changes to commit"
-          git pull --rebase origin main || true
+          git diff --staged --quiet || git commit -m "Update seen rentals state [skip ci]"
+          git pull --rebase origin main
           git push origin main
