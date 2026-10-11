@@ -6,6 +6,7 @@ and sends new matches to Telegram. Runs on GitHub Actions every 6 hours.
 
 Sites that block automated visits are skipped and reported in the summary
 message, so you always know which sites were really checked.
+(Housing.com is not included: it blocks automated visits.)
 """
 import html
 import json
@@ -38,6 +39,7 @@ AREA_WORDS = [
     "kalyan east", "kalyan (east)", "kalyan (e)", "kalyan-east", "kalyan_east",
     "durgadi", "lokgram", "vijay nagar", "suchak naka", "netivali",
     "kolsewadi", "tisgaon", "chinchpada", "katemanivali", "kailash nagar",
+    "chakki naka",
 ]
 PARKING_WORDS = [
     "car parking", "four wheeler", "4 wheeler", "4-wheeler", "four_wheeler",
@@ -54,8 +56,8 @@ SITES = {
     },
     "99acres": {
         "urls": [
-            "https://www.99acres.com/1-bhk-flats-for-rent-in-kalyan-east-thane-ffid",
-            "https://www.99acres.com/rent-property-in-kalyan-east-thane-ffid",
+            "https://www.99acres.com/1-bhk-flats-for-rent-in-kalyan-east-mumbai-beyond-thane-ffid",
+            "https://www.99acres.com/flats-for-rent-in-kalyan-east-mumbai-beyond-thane-ffid",
         ],
         "link_pattern": r"(spid-|-r\d{6,}|-npxid-)",
     },
@@ -66,16 +68,8 @@ SITES = {
         ],
         "link_pattern": r"(propertyDetails|pdpid)",
     },
-    "Housing.com": {
-        "urls": [
-            "https://housing.com/in/rent/1bhk-flats-for-rent-in-kalyan-east-thane",
-            "https://housing.com/in/rent/flats-for-rent-in-kalyan-east-thane",
-        ],
-        "link_pattern": r"/rent/\d{5,}",
-    },
     "Square Yards": {
         "urls": [
-            "https://www.squareyards.com/rent/1-bhk-flats-for-rent-in-kalyan-east-thane",
             "https://www.squareyards.com/rent/property-for-rent-in-kalyan-east-thane",
         ],
         "link_pattern": r"/rent/.*\d{5,}",
