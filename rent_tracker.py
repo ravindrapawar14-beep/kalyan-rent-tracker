@@ -1,19 +1,36 @@
 """
-Kalyan East rental tracker
---------------------------
-Checks the main property websites for 1 BHK / 1 RK rentals in Kalyan East
-and sends new matches to Telegram. Runs on GitHub Actions every 6 hours.
+Kalyan East rental tracker - STRICT mode
+----------------------------------------
+Checks the main property websites and sends a listing to Telegram only if it
+passes ALL of these checks:
 
-Sites that block automated visits are skipped and reported in the summary
-message, so you always know which sites were really checked.
-(Housing.com is not included: it blocks automated visits.)
+  1. 1 BHK or 1 RK only (1.5 / 2 / 3 BHK are dropped)
+  2. Kalyan East only - anything that says Kalyan West is dropped
+  3. Within 2 km of Kalyan railway station (east entry), e.g. Lokgram, Kolsewadi
+  4. Four-wheeler (car) parking clearly mentioned - "no car parking",
+     "two-wheeler only" or no mention at all is dropped
+
+How the 2 km check works:
+  * If the listing has a map pin (latitude/longitude in the page data, or a
+    Google plus code such as "64HQ+V34" in its address), the real straight-line
+    distance to the station is used, and the pin must be on the east side of
+    the railway line.
+  * Otherwise the listing must name a locality from NEAR_LOCALITIES.
+  * No map pin and no known nearby locality = skipped as "location unclear".
+
+The summary message after each run shows how many listings were read on each
+site and why the rest were skipped, so you can see the filter working.
+Runs on GitHub Actions every 6 hours. (Housing.com is not included: it blocks
+automated visits.)
 """
 import html
 import json
+import math
 import os
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from collections import Counter
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -22,11 +39,17 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 STATE_FILE = "seen_listings.json"
 
-# ------------------------------------------------------------------ settings
-# Most listing cards don't say anything about parking. With False, every
-# 1 BHK / 1 RK in Kalyan East is sent and marked "car parking mentioned" or
-# "parking not mentioned". Change to True to only get listings that mention it.
-REQUIRE_CAR_PARKING = False
+# =================================================================== settings
+# Kalyan Junction railway station, east entry (lat, lng)
+STATION = (19.234802, 73.131218)
+MAX_DISTANCE_KM = 2.0
+
+# True = only listings that clearly mention car / four-wheeler parking.
+REQUIRE_CAR_PARKING = True
+
+# Vijay Nagar / Amrai / Tisgaon sit right around the 2 km line.
+# False = skip them (strict). True = include them.
+INCLUDE_BORDERLINE = False
 
 # Send a short "what was checked" summary after every run.
 SEND_SUMMARY_EVERY_RUN = True
@@ -34,18 +57,76 @@ SEND_SUMMARY_EVERY_RUN = True
 LISTINGS_PER_MESSAGE = 8
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
 
-SIZE_WORDS = ["1 bhk", "1bhk", "1-bhk", "1 rk", "1rk", "1-rk", "bhk1", "rk1"]
-AREA_WORDS = [
-    "kalyan east", "kalyan (east)", "kalyan (e)", "kalyan-east", "kalyan_east",
-    "durgadi", "lokgram", "vijay nagar", "suchak naka", "netivali",
-    "kolsewadi", "tisgaon", "chinchpada", "katemanivali", "kailash nagar",
-    "chakki naka",
+# ------------------------------------------------------------------ areas
+# Kalyan East localities inside the 2 km zone (used when there is no map pin).
+NEAR_LOCALITIES = [
+    "lokgram", "lok gram",
+    "kolsewadi", "kolshewadi", "kolsevadi", "kolse wadi", "kolshe wadi",
 ]
-PARKING_WORDS = [
-    "car parking", "four wheeler", "4 wheeler", "4-wheeler", "four_wheeler",
-    "covered parking", "open parking", "car park",
+# Right around 2 km - only used when INCLUDE_BORDERLINE = True.
+BORDERLINE_LOCALITIES = [
+    "vijay nagar", "vijaynagar", "vijayanagar", "vijaya nagar",
+    "amrai", "tisgaon", "tisgao",
+]
+# Kalyan East / nearby areas that are further than 2 km from the station.
+FAR_LOCALITIES = [
+    "katemanivali", "kate manivali", "chinchpada", "chakki naka", "suchak naka",
+    "kailash nagar", "netivali", "pisavli", "pisavali", "adivali", "dhokali",
+    "nandivli", "nandivali", "hanuman nagar", "malang road", "kalyan shil road",
+    "shil phata", "shilphata", "vithalwadi", "vitthalwadi", "ulhasnagar",
+    "ambernath", "badlapur", "dombivli", "dombivali", "thakurli", "titwala",
+    "shahad", "mohone", "ambivli", "bhiwandi", "palava", "kalyan rural",
+]
+# Kalyan West - always dropped.
+WEST_LOCALITIES = [
+    "khadakpada", "birla college", "godrej hill", "adharwadi", "durgadi",
+    "wayle nagar", "gandhare", "gandhari", "barave", "rambaug", "ram baug",
+    "santoshi mata road", "agra road", "chikanghar", "bail bazar",
 ]
 
+
+def _words_re(words):
+    return re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b")
+
+
+NEAR_RE = _words_re(NEAR_LOCALITIES)
+BORDER_RE = _words_re(BORDERLINE_LOCALITIES)
+FAR_RE = _words_re(FAR_LOCALITIES)
+WEST_RE = re.compile(
+    r"\bkalyan\s*\(?\s*w(?:est)?\b|\b421301\b|" + _words_re(WEST_LOCALITIES).pattern
+)
+EAST_RE = re.compile(r"\bkalyan\s*\(?\s*e(?:ast)?\b|\b421306\b")
+
+# Railway line through Kalyan (Thakurli -> Kalyan Jn -> Shahad).
+# Kalyan West is north of this line, Kalyan East is south of it.
+RAIL_LINE = [(19.225507, 73.096730), (19.235250, 73.130500), (19.243889, 73.166389)]
+TRACK_BUFFER_KM = 0.2  # pins this close to the tracks need "Kalyan East" in the text
+
+# ------------------------------------------------------------------ size
+ONE_SIZE_RE = re.compile(r"(?<![\d.])1\s*(?:bhk|rk)\b|\b(?:bhk|rk)1\b")
+OTHER_SIZE_RE = re.compile(r"(?<![\d.])(?:[2-9]|1\.5|2\.5|3\.5)\s*bhk\b|\bbhk[2-9]\b")
+JSON_ONE_BED_RE = re.compile(r'"(?:bedroom_num|bedrooms|bedroom|noofbedrooms|bhk)"\s*:\s*"?1\b')
+
+# ------------------------------------------------------------------ parking
+CAR = r"(?:cars?|four\s*wheelers?|4\s*wheelers?|4w)"
+CAR_PARKING_RE = re.compile(
+    rf"\b{CAR}\s+(?:parking|park)\b"
+    rf"|\bparking\s*(?:for|:|available for|-)?\s*(?:a\s+|one\s+|1\s+)?{CAR}\b"
+)
+NO_CAR_PARKING_RE = re.compile(
+    rf"\b(?:no|not|without|nil)\s+(?:any\s+|covered\s+|open\s+|reserved\s+)?{CAR}\s+park"
+    rf"|\b{CAR}\s+parking\s*(?::|is)?\s*(?:not\s+available|unavailable|not\s+allowed|not\s+provided"
+    rf"|no\b|none\b|nil\b|na\b|n/a|0\b)"
+    r"|\bonly\s+(?:two|2)\s*wheeler|\b(?:two|2)\s*wheeler\s+(?:parking\s+)?only"
+    r"|\bbike\s+parking\s+only|\bonly\s+bike\s+parking"
+)
+# NoBroker page data: "parking": "BOTH" / "FOUR_WHEELER" / "TWO_WHEELER" / "NONE"
+NB_PARKING_RE = re.compile(r'"parking"\s*:\s*"(both|four_wheeler|two_wheeler|none)"')
+JSON_CAR_FIELD_RE = re.compile(
+    r'"(?:car_?parking|four_?wheeler_?parking|covered_?car_?parking)"\s*:\s*"?([^",}]*)'
+)
+
+# ------------------------------------------------------------------ sites
 SITES = {
     "NoBroker": {
         "urls": [
@@ -53,6 +134,7 @@ SITES = {
             "https://www.nobroker.in/flats-for-rent-in-kalyan_east_mumbai",
         ],
         "link_pattern": r"/property/",
+        "must_match": r"/property/.+/detail",  # skips search-result pages
     },
     "99acres": {
         "urls": [
@@ -67,6 +149,7 @@ SITES = {
             "https://www.magicbricks.com/flats-for-rent-in-kalyan-east-thane-pppfr",
         ],
         "link_pattern": r"(propertyDetails|pdpid)",
+        "must_match": r"(propertyDetails|pdpid)",
     },
     "Square Yards": {
         "urls": [
@@ -86,6 +169,7 @@ HEADERS = {
 }
 
 BAD_URL_KEYS = ["image", "img", "photo", "thumb", "logo", "video", "canonical", "builder", "agent"]
+BULKY_KEYS = ["image", "img", "photo", "thumb", "video", "gallery", "media", "banner"]
 IMAGE_RE = re.compile(r"\.(jpe?g|png|webp|gif|svg)(\?|$)", re.I)
 LD_LISTING_TYPES = {
     "listitem", "apartment", "residence", "singlefamilyresidence", "house",
@@ -96,6 +180,17 @@ PRICE_KEYS = [
     "rent", "price", "PRICE", "formattedPrice", "displayPrice", "expectedRent",
     "monthlyRent", "priceD", "MIN_PRICE",
 ]
+LAT_KEYS = {"latitude", "lat", "lattitude", "geolat", "maplat"}
+LNG_KEYS = {"longitude", "lng", "lon", "long", "geolng", "geolon", "maplng", "maplong"}
+
+SKIP_REASONS = {
+    "size": "not 1BHK/1RK",
+    "west": "Kalyan West",
+    "far": "beyond 2 km",
+    "border": "~2 km borderline",
+    "unclear": "location unclear",
+    "parking": "no car parking",
+}
 
 
 # ------------------------------------------------------------------ state
@@ -136,21 +231,226 @@ def send_telegram(text):
     return False
 
 
-# ------------------------------------------------------------------ helpers
+# ------------------------------------------------------------------ geo helpers
+def distance_km(a, b):
+    lat1, lng1, lat2, lng2 = map(math.radians, (*a, *b))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2
+    return 6371.0 * 2 * math.asin(math.sqrt(h))
+
+
+def side_of_tracks(point):
+    """'east', 'west', or 'unclear' (pin sits on / right next to the tracks)."""
+    lat0 = math.radians(STATION[0])
+
+    def xy(p):  # local km coordinates
+        return ((p[1] - STATION[1]) * 111.32 * math.cos(lat0), (p[0] - STATION[0]) * 110.57)
+
+    px, py = xy(point)
+    best = None
+    for a, b in zip(RAIL_LINE, RAIL_LINE[1:]):
+        (ax, ay), (bx, by) = xy(a), xy(b)
+        dx, dy = bx - ax, by - ay
+        seg_len2 = dx * dx + dy * dy
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len2))
+        cx, cy = ax + t * dx, ay + t * dy
+        dist = math.hypot(px - cx, py - cy)
+        cross = dx * (py - ay) - dy * (px - ax)  # > 0 means north of the line
+        if best is None or dist < best[0]:
+            best = (dist, cross)
+    dist, cross = best
+    if dist < TRACK_BUFFER_KM:
+        return "unclear"
+    return "west" if cross > 0 else "east"
+
+
+def valid_coords(lat, lng):
+    return 18.9 < lat < 19.6 and 72.8 < lng < 73.5  # roughly Mumbai-Kalyan region
+
+
+# Google plus codes ("64HQ+V34", "7JFM64HQ+V34") - often in NoBroker addresses
+OLC_ALPHABET = "23456789CFGHJMPQRVWX"
+PLUS_CODE_RE = re.compile(
+    r"(?<![0-9a-z])((?:[23456789cfghjmpqrvwx]{4})?[23456789cfghjmpqrvwx]{4})"
+    r"\+([23456789cfghjmpqrvwx]{2,3})(?![0-9a-z])",
+    re.I,
+)
+
+
+def _olc_decode(code):
+    code = code.upper().replace("+", "")
+    lat = lng = 0.0
+    lat_res = lng_res = 400.0
+    for i in range(0, min(len(code), 10), 2):
+        lat_res /= 20
+        lng_res /= 20
+        lat += OLC_ALPHABET.index(code[i]) * lat_res
+        lng += OLC_ALPHABET.index(code[i + 1]) * lng_res
+    for ch in code[10:]:
+        lat_res /= 5
+        lng_res /= 4
+        idx = OLC_ALPHABET.index(ch)
+        lat += (idx // 4) * lat_res
+        lng += (idx % 4) * lng_res
+    return lat - 90 + lat_res / 2, lng - 180 + lng_res / 2
+
+
+def _olc_prefix(lat, lng):
+    lat, lng, out = lat + 90, lng + 180, ""
+    for res in (20.0, 1.0):
+        a, b = int(lat // res), int(lng // res)
+        out += OLC_ALPHABET[a] + OLC_ALPHABET[b]
+        lat, lng = lat - a * res, lng - b * res
+    return out
+
+
+def coords_from_plus_code(text):
+    m = PLUS_CODE_RE.search(text)
+    if not m:
+        return None
+    head, tail = m.group(1).upper(), m.group(2).upper()
+    if len(head) == 4:  # short code -> recover it near Kalyan station
+        lat, lng = _olc_decode(_olc_prefix(*STATION) + head + tail)
+        if STATION[0] + 0.5 < lat:
+            lat -= 1
+        elif STATION[0] - 0.5 > lat:
+            lat += 1
+        if STATION[1] + 0.5 < lng:
+            lng -= 1
+        elif STATION[1] - 0.5 > lng:
+            lng += 1
+    else:
+        lat, lng = _olc_decode(head + tail)
+    return (lat, lng) if valid_coords(lat, lng) else None
+
+
+def coords_from_node(node):
+    """Find a latitude/longitude pair in a listing's page data (shallow first)."""
+    queue = [(node, 0)]
+    while queue:
+        cur, depth = queue.pop(0)
+        if isinstance(cur, dict):
+            lat = lng = None
+            for k, v in cur.items():
+                kl = k.lower()
+                try:
+                    if kl in LAT_KEYS:
+                        lat = float(v)
+                    elif kl in LNG_KEYS:
+                        lng = float(v)
+                except (TypeError, ValueError):
+                    pass
+            if lat is not None and lng is not None and valid_coords(lat, lng):
+                return (lat, lng)
+            if depth < 4:
+                queue.extend((v, depth + 1) for v in cur.values() if isinstance(v, (dict, list)))
+        elif isinstance(cur, list) and depth < 4:
+            queue.extend((v, depth + 1) for v in cur[:20])
+    return None
+
+
+# ------------------------------------------------------------------ criteria
+def normalize(text):
+    t = unquote(text).lower()
+    t = t.replace("-", " ")
+    return re.sub(r"\s+", " ", t)
+
+
+def check_size(title, text):
+    for part in (normalize(title), text):
+        one = ONE_SIZE_RE.search(part) or JSON_ONE_BED_RE.search(part)
+        other = OTHER_SIZE_RE.search(part)
+        if one or other:
+            return bool(one) and not other
+    return False
+
+
+def check_parking(raw, text):
+    """Returns 'yes', 'no' or 'unknown'."""
+    m = NB_PARKING_RE.search(raw)
+    if m and m.group(1) in ("two_wheeler", "none"):
+        return "no"
+    for value in JSON_CAR_FIELD_RE.findall(raw):
+        v = value.strip().lower()
+        if v in ("", "0", "no", "none", "null", "false", "na", "n/a", "not available"):
+            return "no"
+    if NO_CAR_PARKING_RE.search(text):
+        return "no"
+    if m or CAR_PARKING_RE.search(text):
+        return "yes"
+    for value in JSON_CAR_FIELD_RE.findall(raw):
+        if value.strip():
+            return "yes"
+    return "unknown"
+
+
+def _area_verdict(scope):
+    """Decide from locality names in one piece of text. None = no names found."""
+    west = WEST_RE.search(scope)
+    near = NEAR_RE.search(scope)
+    border = BORDER_RE.search(scope)
+    far = FAR_RE.search(scope)
+    if not (west or near or border or far):
+        return None
+    if west and not (near or border):
+        return False, "west", west.group(0)
+    if far and not (near or border):
+        return False, "far", far.group(1)
+    if near and not (far or west):
+        return True, "", near.group(1).title()
+    if border and not (far or west):
+        if INCLUDE_BORDERLINE:
+            return True, "", border.group(1).title() + " (~2 km)"
+        return False, "border", border.group(1)
+    return False, "unclear", "mixed localities"
+
+
+def check_location(headline, text, coords):
+    """Returns (ok, skip_reason_key, place_label)."""
+    if coords:
+        dist = distance_km(STATION, coords)
+        side = side_of_tracks(coords)
+        if dist > MAX_DISTANCE_KM:
+            return False, "far", f"{dist:.1f} km"
+        if side == "west" or (WEST_RE.search(headline) and not NEAR_RE.search(headline)):
+            return False, "west", f"{dist:.1f} km, west side"
+        if side == "unclear" and not (EAST_RE.search(text) or NEAR_RE.search(text)):
+            return False, "unclear", "pin on the tracks"
+        name = NEAR_RE.search(text) or BORDER_RE.search(text)
+        label = f"{name.group(1).title()} · " if name else ""
+        return True, "", f"{label}{dist:.1f} km from station (map pin)"
+    # no map pin -> the title/link decides first, then the full text
+    for scope in (headline, text):
+        verdict = _area_verdict(scope)
+        if verdict:
+            return verdict
+    return False, "unclear", "no locality"
+
+
+def evaluate(item):
+    """Returns (ok, skip_reason_key)."""
+    raw = item["text"].lower()
+    text = normalize(item["text"])
+    headline = normalize(item["title"] + " " + item["url"])
+
+    if not check_size(item["title"], text):
+        return False, "size"
+
+    coords = item.get("coords") or coords_from_plus_code(unquote(raw))
+    ok, reason, place = check_location(headline, text, coords)
+    item["place"] = place
+    if not ok:
+        return False, reason
+
+    parking = check_parking(raw, text)
+    item["parking"] = parking == "yes"
+    if parking == "no" or (REQUIRE_CAR_PARKING and parking != "yes"):
+        return False, "parking"
+    return True, ""
+
+
+# ------------------------------------------------------------------ page parsing
 def normalize_url(url):
     return url.split("#")[0].split("?")[0].rstrip("/")
-
-
-def classify(text):
-    t = text.lower()
-    size_ok = any(w in t for w in SIZE_WORDS) or bool(
-        re.search(r'"(?:bedroom_num|bedrooms|bedroom|noofbedrooms|bhk)"\s*:\s*"?1\b', t)
-    )
-    area_ok = any(w in t for w in AREA_WORDS)
-    parking = any(w in t for w in PARKING_WORDS) or bool(
-        re.search(r'"parking"\s*:\s*"(both|four_wheeler)"', t)
-    )
-    return size_ok, area_ok, parking
 
 
 def first_value(d, keys):
@@ -159,6 +459,20 @@ def first_value(d, keys):
         if isinstance(v, (str, int, float)) and str(v).strip():
             return str(v).strip()
     return ""
+
+
+def compact(node, depth=0):
+    """Listing data without photo lists etc., so the useful fields fit in the text."""
+    if depth > 5:
+        return None
+    if isinstance(node, dict):
+        return {
+            k: compact(v, depth + 1) for k, v in node.items()
+            if not any(b in k.lower() for b in BULKY_KEYS)
+        }
+    if isinstance(node, list):
+        return [compact(v, depth + 1) for v in node[:5]]
+    return node
 
 
 def extract_json_blobs(soup, raw):
@@ -250,7 +564,8 @@ def listings_from_json(blobs, base_url, link_pattern):
                         "title": first_value(node, TITLE_KEYS),
                         "price": price,
                         "url": full,
-                        "text": json.dumps(node, ensure_ascii=False)[:3000] + " " + full,
+                        "coords": coords_from_node(node),
+                        "text": json.dumps(compact(node), ensure_ascii=False)[:10000] + " " + full,
                     }
             for v in node.values():
                 walk(v, depth + 1)
@@ -266,6 +581,7 @@ def listings_from_json(blobs, base_url, link_pattern):
 def listings_from_links(soup, base_url, link_pattern):
     found = {}
     domain = urlparse(base_url).netloc
+
     def is_listing_link(href):
         full = urljoin(base_url, href)
         if urlparse(full).netloc != domain:
@@ -301,11 +617,12 @@ def listings_from_links(soup, base_url, link_pattern):
         price = ""
         m = re.search(r"₹\s?[\d,\.]+\s*(?:k|lac|lakh|/month)?", text, re.I)
         if m:
-            price = m.group(0)
+            price = m.group(0).strip()
         found[key] = {
             "title": (a.get_text(" ", strip=True) or a.get("title") or "")[:120],
             "price": price,
             "url": key,
+            "coords": None,
             "text": text + " " + key,
         }
     return list(found.values())
@@ -349,20 +666,40 @@ def check_site(session, site, cfg):
                 item["title"] = item["title"] or merged[item["url"]]["title"]
                 item["price"] = item["price"] or merged[item["url"]]["price"]
             merged[item["url"]] = item
+        if cfg.get("must_match"):
+            merged = {u: i for u, i in merged.items() if re.search(cfg["must_match"], u)}
 
-        matches = []
+        # The same pin on 3+ listings is a locality centre, not the flat - ignore it.
+        pins = Counter(
+            (round(i["coords"][0], 4), round(i["coords"][1], 4))
+            for i in merged.values() if i.get("coords")
+        )
         for item in merged.values():
-            size_ok, area_ok, parking = classify(item["text"])
-            if size_ok and area_ok and (parking or not REQUIRE_CAR_PARKING):
-                item["parking"] = parking
+            c = item.get("coords")
+            if c and pins[(round(c[0], 4), round(c[1], 4))] >= 3:
+                item["coords"] = None
+
+        matches, skipped = [], Counter()
+        for item in merged.values():
+            ok, reason = evaluate(item)
+            if ok:
                 item["site"] = site
                 matches.append(item)
+            else:
+                skipped[reason] += 1
+                if sum(skipped.values()) <= 5:
+                    print(f"    skip ({SKIP_REASONS[reason]}, {item.get('place', '')}): {item['url']}")
         for item in matches[:3]:
-            print(f"    e.g. {item['title'][:60]!r} {item['price']} {item['url']}")
-        print(f"    matching your criteria: {len(matches)}")
+            print(f"    MATCH {item['title'][:60]!r} {item['price']} {item['place']} {item['url']}")
+        print(f"    matching your criteria: {len(matches)}  skipped: {dict(skipped)}")
 
         if merged:
-            return matches, f"{len(merged)} listings read, {len(matches)} match"
+            status = f"{len(merged)} listings read, {len(matches)} match"
+            if skipped:
+                status += " (skipped: " + ", ".join(
+                    f"{n} {SKIP_REASONS[k]}" for k, n in skipped.most_common()
+                ) + ")"
+            return matches, status
         if "captcha" in r.text.lower() or "access denied" in r.text[:3000].lower():
             last_problem = "blocked automated access (captcha page)"
         else:
@@ -373,16 +710,23 @@ def check_site(session, site, cfg):
 def format_listing(item):
     title = html.escape(item["title"] or "1 BHK / 1 RK")
     price = html.escape(item["price"]) if item["price"] else "price not shown"
-    park = "🚗 car parking mentioned" if item["parking"] else "🅿️ parking not mentioned"
     return (
         f"🏠 <b>{title}</b>\n"
-        f"💰 {price} · {park}\n"
+        f"💰 {price} · 🚗 car parking\n"
+        f"📍 {html.escape(item.get('place') or 'Kalyan East')}\n"
         f"🔗 <a href=\"{html.escape(item['url'])}\">Open on {html.escape(item['site'])}</a>"
     )
 
 
+def criteria_line():
+    parts = [f"Kalyan East · ≤{MAX_DISTANCE_KM:g} km from station", "1BHK/1RK"]
+    if REQUIRE_CAR_PARKING:
+        parts.append("4-wheeler parking")
+    return " · ".join(parts)
+
+
 def main():
-    print("Checking Kalyan East rentals on all sites...\n")
+    print(f"Checking rentals: {criteria_line()}\n")
     seen = load_seen()
     session = requests.Session()
 
@@ -400,7 +744,11 @@ def main():
     sent = 0
     chunks = [new_items[i:i + LISTINGS_PER_MESSAGE] for i in range(0, len(new_items), LISTINGS_PER_MESSAGE)]
     for n, chunk in enumerate(chunks[:MAX_MESSAGES_PER_RUN], start=1):
-        header = f"🚨 <b>New Kalyan East rentals</b> ({n}/{min(len(chunks), MAX_MESSAGES_PER_RUN)})\n\n"
+        header = (
+            f"🚨 <b>New rentals near Kalyan station (East)</b> "
+            f"({n}/{min(len(chunks), MAX_MESSAGES_PER_RUN)})\n"
+            f"<i>{html.escape(criteria_line())}</i>\n\n"
+        )
         if send_telegram(header + "\n\n".join(format_listing(i) for i in chunk)):
             for item in chunk:
                 seen.add(f"{item['site']}|{item['url']}")
@@ -409,7 +757,8 @@ def main():
 
     if SEND_SUMMARY_EVERY_RUN:
         left = len(new_items) - sent
-        text = "ℹ️ <b>Kalyan rental check done</b>\n\n" + "\n".join(summary)
+        text = "ℹ️ <b>Kalyan rental check done</b>\n"
+        text += f"<i>{html.escape(criteria_line())}</i>\n\n" + "\n".join(summary)
         text += f"\n\nNew listings sent: {sent}"
         if left > 0:
             text += f" ({left} more will come next run)"
