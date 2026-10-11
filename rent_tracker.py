@@ -24,6 +24,13 @@ Each Telegram alert carries the rent, deposit, maintenance, size, furnishing,
 floor, parking type, availability and posting date (whatever the site shows),
 whether it is an owner listing (no brokerage), how to contact, and the link.
 
+Alerts also go to WhatsApp (free CallMeBot service, personal use) for every
+number in the GitHub secret WHATSAPP_RECIPIENTS, written as
+    919876543210:1234567,919812345678:7654321
+(phone with country code : that phone's CallMeBot apikey). Each person gets
+their apikey once by sending "I allow callmebot to send me messages" on
+WhatsApp to the CallMeBot number listed on callmebot.com.
+
 The summary message after each run shows how many listings were read on each
 site and why the rest were skipped, so you can see the filter working.
 Runs on GitHub Actions every 6 hours. (Housing.com is not included: it blocks
@@ -31,6 +38,7 @@ automated visits.)
 """
 import copy
 import datetime
+import hashlib
 import html
 import json
 import math
@@ -45,6 +53,7 @@ from bs4 import BeautifulSoup
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+WHATSAPP_RECIPIENTS = os.environ.get("WHATSAPP_RECIPIENTS", "")
 STATE_FILE = "seen_listings.json"
 
 # =================================================================== settings
@@ -65,6 +74,11 @@ INCLUDE_BORDERLINE = False
 
 # Send a short "what was checked" summary after every run.
 SEND_SUMMARY_EVERY_RUN = True
+
+# WhatsApp: the 6-hourly "check done" summary stays on Telegram only (False).
+WHATSAPP_SEND_SUMMARY = False
+WHATSAPP_MAX_PER_RUN = 10     # new-listing messages per number per run
+WHATSAPP_WELCOME_MAX = 10     # a newly added number first gets this many current matches
 
 LISTINGS_PER_MESSAGE = 4  # detailed alerts are longer (Telegram max 4096 chars)
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
@@ -264,6 +278,90 @@ def send_telegram(text):
     except Exception as e:
         print(f"Telegram request failed: {e}")
     return False
+
+
+# ------------------------------------------------------------------ whatsapp
+def whatsapp_recipients():
+    """[(phone, apikey)] from the WHATSAPP_RECIPIENTS secret."""
+    out = []
+    for part in re.split(r"[,;\n]+", WHATSAPP_RECIPIENTS or ""):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            print("WhatsApp: an entry has no ':apikey' part - skipped")
+            continue
+        phone, key = part.split(":", 1)
+        phone = re.sub(r"\D", "", phone)
+        key = key.strip()
+        if len(phone) == 10:  # Indian mobile written without 91
+            phone = "91" + phone
+        if len(phone) < 11 or not key:
+            print("WhatsApp: an entry looks incomplete - skipped")
+            continue
+        # hide the number and key in the GitHub Actions log
+        print(f"::add-mask::{key}")
+        print(f"::add-mask::{phone}")
+        out.append(("+" + phone, key))
+    return out
+
+
+def masked(phone):
+    return phone[:3] + "*****" + phone[-3:]
+
+
+def whatsapp_id(phone):
+    return "WA|" + hashlib.sha256(phone.encode()).hexdigest()[:16]
+
+
+def to_whatsapp_text(html_text):
+    """Telegram HTML -> WhatsApp text (*bold*, _italic_, plain links)."""
+    t = re.sub(r'<a href="([^"]+)">([^<]*)</a>', lambda m: f"{m.group(2)}: {m.group(1)}", html_text)
+    t = re.sub(r"</?b>", "*", t)
+    t = re.sub(r"</?i>", "_", t)
+    t = re.sub(r"<[^>]+>", "", t)
+    return html.unescape(t)
+
+
+def send_whatsapp(phone, apikey, text):
+    try:
+        r = requests.get(
+            "https://api.callmebot.com/whatsapp.php",
+            params={"phone": phone, "text": text, "apikey": apikey},
+            timeout=30,
+        )
+        reply = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text)).strip()
+        ok = r.ok and not re.search(r"\b(error|invalid|wrong|not allowed|blocked)\b", reply, re.I)
+        print(f"WhatsApp {masked(phone)}: {'sent' if ok else 'FAILED'} - {reply[:120]}")
+        time.sleep(3)  # CallMeBot asks for a gentle pace
+        return ok
+    except Exception as e:
+        print(f"WhatsApp {masked(phone)}: request failed: {e}")
+        return False
+
+
+def whatsapp_listing(item):
+    return to_whatsapp_text("🚨 <b>New rental near Kalyan station (East)</b>\n\n" + format_listing(item))
+
+
+def whatsapp_welcome(matches):
+    """Messages for a newly added number: hello + current matches (compact)."""
+    msgs = [to_whatsapp_text(
+        "✅ <b>Kalyan rent alerts connected</b>\n"
+        f"<i>{html.escape(criteria_line())}</i>\n\n"
+        "New listings will come here as soon as they appear. "
+        + (f"Here are the {min(len(matches), WHATSAPP_WELCOME_MAX)} current matches:" if matches
+           else "No listing matches right now.")
+    )]
+    lines = []
+    for n, m in enumerate(matches[:WHATSAPP_WELCOME_MAX], start=1):
+        price = f"{_money(m['price'])}/month" if m["price"] else "rent not shown"
+        lines.append(f"{n}. *{price}* · {m.get('place', '')}\n{m['title'][:70]}\n{m['url']}")
+    for i in range(0, len(lines), 5):
+        msgs.append("\n\n".join(lines[i:i + 5]))
+    if len(matches) > WHATSAPP_WELCOME_MAX:
+        msgs.append(f"+ {len(matches) - WHATSAPP_WELCOME_MAX} more matches - see Telegram.")
+    return msgs
 
 
 # ------------------------------------------------------------------ geo helpers
@@ -926,10 +1024,15 @@ def main():
     print(f"Checking rentals: {criteria_line()}\n")
     seen = load_seen()
     session = requests.Session()
+    recipients = whatsapp_recipients()
+    wa_new = [r for r in recipients if whatsapp_id(r[0]) not in seen]   # just added
+    wa_old = [r for r in recipients if whatsapp_id(r[0]) in seen]
+    print(f"WhatsApp numbers: {len(recipients)} ({len(wa_new)} new)\n")
 
-    new_items, summary = [], []
+    new_items, all_matches, summary = [], [], []
     for site, cfg in SITES.items():
         matches, status = check_site(session, site, cfg)
+        all_matches.extend(matches)
         fresh = [m for m in matches if f"{site}|{m['url']}" not in seen and m["url"] not in seen]
         new_items.extend(fresh)
         icon = "✅" if "listings read" in status else "⚠️"
@@ -939,6 +1042,7 @@ def main():
 
     print(f"New listings this run: {len(new_items)}")
     sent = 0
+    wa_sent = Counter()
     chunks = [new_items[i:i + LISTINGS_PER_MESSAGE] for i in range(0, len(new_items), LISTINGS_PER_MESSAGE)]
     for n, chunk in enumerate(chunks[:MAX_MESSAGES_PER_RUN], start=1):
         header = (
@@ -946,11 +1050,24 @@ def main():
             f"({n}/{min(len(chunks), MAX_MESSAGES_PER_RUN)})\n"
             f"<i>{html.escape(criteria_line())}</i>\n\n"
         )
-        if send_telegram(header + "\n\n".join(format_listing(i) for i in chunk)):
-            for item in chunk:
-                seen.add(f"{item['site']}|{item['url']}")
-            sent += len(chunk)
+        tg_ok = send_telegram(header + "\n\n".join(format_listing(i) for i in chunk))
         time.sleep(1)
+        for item in chunk:
+            wa_ok = False
+            for phone, key in wa_old:
+                if wa_sent[phone] < WHATSAPP_MAX_PER_RUN and send_whatsapp(phone, key, whatsapp_listing(item)):
+                    wa_sent[phone] += 1
+                    wa_ok = True
+            if tg_ok or wa_ok:
+                seen.add(f"{item['site']}|{item['url']}")
+                sent += 1
+
+    # numbers added since the last run: a welcome + the current matches (also a test)
+    for phone, key in wa_new:
+        msgs = whatsapp_welcome(all_matches)
+        if all([send_whatsapp(phone, key, m) for m in msgs]):
+            seen.add(whatsapp_id(phone))
+            wa_sent[phone] += len(msgs)
 
     if SEND_SUMMARY_EVERY_RUN:
         left = len(new_items) - sent
@@ -959,7 +1076,12 @@ def main():
         text += f"\n\nNew listings sent: {sent}"
         if left > 0:
             text += f" ({left} more will come next run)"
+        if recipients:
+            text += f"\nWhatsApp: {len(recipients)} number(s), {sum(wa_sent.values())} message(s) sent"
         send_telegram(text)
+        if WHATSAPP_SEND_SUMMARY:
+            for phone, key in recipients:
+                send_whatsapp(phone, key, to_whatsapp_text(text))
 
     save_seen(seen)
     print(f"Done. Sent {sent} new listings.")
