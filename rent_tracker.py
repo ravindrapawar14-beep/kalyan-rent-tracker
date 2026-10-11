@@ -85,6 +85,10 @@ WHATSAPP_WELCOME_MAX = 10     # a newly added number first gets this many curren
 # for nearby candidates. Max pages opened per site per run:
 DETAIL_FETCH_MAX = 15
 
+# When a listing gives no address but shares a map location, look the address up
+# from the pin (OpenStreetMap, free) and add a map link to the alert.
+FILL_ADDRESS_FROM_PIN = True
+
 LISTINGS_PER_MESSAGE = 4  # detailed alerts are longer (Telegram max 4096 chars)
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
 
@@ -292,6 +296,55 @@ def send_telegram(text):
     except Exception as e:
         print(f"Telegram request failed: {e}")
     return False
+
+
+# ------------------------------------------------------------------ address from pin
+_geo_cache = {}
+
+
+def address_from_pin(lat, lng):
+    """Street / area name for a map pin, via OpenStreetMap (1 request per second)."""
+    key = (round(lat, 5), round(lng, 5))
+    if key in _geo_cache:
+        return _geo_cache[key]
+    addr = ""
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": f"{lat:.6f}", "lon": f"{lng:.6f}", "format": "jsonv2",
+                    "zoom": 17, "addressdetails": 1},
+            headers={"User-Agent": "kalyan-rent-tracker/1.0 (personal rental alerts)",
+                     "Accept-Language": "en"},
+            timeout=15,
+        )
+        time.sleep(1.1)  # OpenStreetMap usage policy: max 1 request per second
+        if r.ok:
+            data = r.json()
+            a = data.get("address") or {}
+            parts = []
+            for k in ("house_number", "road", "neighbourhood", "suburb", "quarter",
+                      "city_district", "city", "town"):
+                v = a.get(k)
+                if v and v not in parts:
+                    parts.append(v)
+            addr = ", ".join(parts[:4]) or (data.get("display_name") or "")[:80]
+    except Exception as e:
+        print(f"Address lookup failed: {e.__class__.__name__}")
+    _geo_cache[key] = addr
+    return addr
+
+
+def fill_missing_addresses(items):
+    filled = 0
+    for item in items:
+        d = item.setdefault("details", {})
+        if d.get("address") or not item.get("coords"):
+            continue
+        addr = address_from_pin(*item["coords"])
+        if addr:
+            item["geo_address"] = addr
+            filled += 1
+    return filled
 
 
 # ------------------------------------------------------------------ whatsapp
@@ -600,6 +653,8 @@ def evaluate(item):
         return False, "size"
 
     coords = item.get("coords") or coords_from_plus_code(unquote(raw))
+    if coords:
+        item["coords"] = coords
     ok, reason, place = check_location(headline, text, coords)
     item["place"] = place
     if not ok:
@@ -1118,8 +1173,17 @@ def format_listing(item):
     if flat:
         lines.append("📐 " + e(" · ".join(flat)))
     lines.append("🚗 " + e(d.get("parking") or "Car parking mentioned"))
-    lines.append("📍 " + e(item.get("place") or "Kalyan East")
-                 + (f" · {e(d['address'][:80])}" if d.get("address") else ""))
+    loc = e(item.get("place") or "Kalyan East")
+    if d.get("address"):
+        loc += f" · {e(d['address'][:80])}"
+    elif item.get("geo_address"):
+        loc += f" · {e(item['geo_address'][:80])} (from map pin)"
+    else:
+        loc += " · address not given on the site"
+    lines.append("📍 " + loc)
+    if item.get("coords"):
+        lat, lng = item["coords"]
+        lines.append(f"🗺 <a href=\"https://maps.google.com/?q={lat:.6f},{lng:.6f}\">Map location</a>")
     if when:
         lines.append("🗓 " + e(" · ".join(when)))
     if item.get("brokerage"):
@@ -1162,6 +1226,10 @@ def main():
         time.sleep(2)  # be polite between sites
 
     print(f"New listings this run: {len(new_items)}")
+    filled = 0
+    if FILL_ADDRESS_FROM_PIN:
+        filled = fill_missing_addresses(new_items[:LISTINGS_PER_MESSAGE * MAX_MESSAGES_PER_RUN])
+        print(f"Addresses filled from map pins: {filled}")
     sent = 0
     wa_sent = Counter()
     chunks = [new_items[i:i + LISTINGS_PER_MESSAGE] for i in range(0, len(new_items), LISTINGS_PER_MESSAGE)]
@@ -1195,6 +1263,8 @@ def main():
         text = "ℹ️ <b>Kalyan rental check done</b>\n"
         text += f"<i>{html.escape(criteria_line())}</i>\n\n" + "\n".join(summary)
         text += f"\n\nNew listings sent: {sent}"
+        if filled:
+            text += f" ({filled} address(es) filled from map pins)"
         if left > 0:
             text += f" ({left} more will come next run)"
         if recipients:
