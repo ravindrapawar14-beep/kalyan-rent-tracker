@@ -105,6 +105,10 @@ FILL_ADDRESS_FROM_PIN = True
 # car or bike. True = send these, marked "confirm it is a car spot".
 ACCEPT_PARKING_SPOT = True
 
+# Only ads posted (or re-posted by the owner) within this many days. 0 = no limit.
+# Ads whose site shows no date at all are kept and marked "ad date not shown".
+MAX_AD_AGE_DAYS = 30
+
 LISTINGS_PER_MESSAGE = 4  # detailed alerts are longer (Telegram max 4096 chars)
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
 
@@ -286,6 +290,7 @@ SKIP_REASONS = {
     "border": "~2 km borderline",
     "unclear": "location unclear",
     "parking": "no car parking",
+    "old": "ad older than 30 days",
 }
 
 
@@ -1176,8 +1181,14 @@ def check_site(session, site, cfg, seen=None):
             print(f"    detail pages opened: {min(len(todo), DETAIL_FETCH_MAX)} of {len(todo)} candidates")
 
     matches, skipped = [], Counter()
+    today = datetime.datetime.now(datetime.timezone.utc).date()
     for item in merged.values():
         ok, reason = results[item["url"]]
+        if ok and MAX_AD_AGE_DAYS:
+            posted_on = ad_date(item)
+            if posted_on and (today - posted_on).days > MAX_AD_AGE_DAYS:
+                ok, reason = False, "old"
+                item["place"] = f"ad posted {posted_on:%d %b %Y}"
         if ok:
             item["site"] = site
             item["brokerage"] = item.get("brokerage_override") or cfg.get("brokerage", "")
@@ -1206,6 +1217,39 @@ def _parse_shown_date(text):
         return datetime.datetime.strptime(text, "%d %b %Y").date()
     except (TypeError, ValueError):
         return None
+
+
+def _parse_any_date(text):
+    """'05 Oct 2026', '5 October, 2026', '3 days ago', 'today' -> date."""
+    if not text:
+        return None
+    t = str(text).strip()
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    low = t.lower()
+    if low == "today":
+        return today
+    if low == "yesterday":
+        return today - datetime.timedelta(days=1)
+    m = re.match(r"(\d+)\s+(day|week|month)s?\s+ago", low)
+    if m:
+        per = {"day": 1, "week": 7, "month": 30}[m.group(2)]
+        return today - datetime.timedelta(days=int(m.group(1)) * per)
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d %b, %Y", "%d %B, %Y"):
+        try:
+            return datetime.datetime.strptime(t, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def ad_date(item):
+    """Latest posting date of the ad (site date first, else NoBroker's listing id)."""
+    d = _parse_any_date((item.get("details") or {}).get("posted"))
+    if d:
+        return d
+    if "nobroker.in" in item["url"]:
+        return _parse_shown_date(nobroker_posted(item["url"]))
+    return None
 
 
 def _days_ago(text):
@@ -1258,6 +1302,8 @@ def format_listing(item):
         if first and first != d["posted"] and _days_between(first, d["posted"]) > 30:
             posted += f" (first listed {first})"
         when.append(posted)
+    else:
+        when.append("Ad date not shown on the site")
 
     lines = [
         f"🏠 <b>{e((item['title'] or '1 BHK / 1 RK')[:120])}</b>",
@@ -1293,6 +1339,8 @@ def criteria_line():
         f"Chakki Naka & other named areas ≤{EXTENDED_AREA_MAX_KM:g} km",
         "1BHK/1RK",
     ]
+    if MAX_AD_AGE_DAYS:
+        parts.append(f"ads from last {MAX_AD_AGE_DAYS} days")
     if REQUIRE_CAR_PARKING:
         parts.append("4-wheeler parking")
     return " · ".join(parts)
