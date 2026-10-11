@@ -62,7 +62,19 @@ STATION = (19.234802, 73.131218)
 MAX_DISTANCE_KM = 2.0
 # Areas you asked for that sit a little beyond 2 km: listings naming them may
 # be up to EXTENDED_AREA_MAX_KM away on the map.
-EXTENDED_AREAS = ["chakki naka", "chakkinaka"]
+EXTENDED_AREAS = [
+    "chakki naka", "chakkinaka",
+    "vijay nagar", "vijaynagar", "vijayanagar", "vijaya nagar",
+    "karpewadi", "karpe wadi",
+    "jimmy baug", "jimmybaug", "jimmy bag", "jimmybag", "jimmi baug",
+    "hanuman wadi", "hanumanwadi",
+    "katemanivali", "kate manivali", "katemanevali", "katemaniwali", "katemanewali",
+    "chiknipada", "chikni pada",
+    "mhasoba chowk", "mhasoba",
+]
+# "Chakki Naka" is also used loosely for far-off places - such listings are
+# dropped when their address names a far area.
+LOOSE_AREAS = ["chakki naka", "chakkinaka"]
 EXTENDED_AREA_MAX_KM = 3.0
 
 # True = only listings that clearly mention car / four-wheeler parking.
@@ -104,20 +116,27 @@ NEAR_LOCALITIES = [
     "shivaji colony", "prabhuram nagar",
     "tisgao naka", "tisgaon naka", "santosh nagar",
     "chakki naka", "chakkinaka",
+    # added on request
+    "vijay nagar", "vijaynagar", "vijayanagar", "vijaya nagar",
+    "karpewadi", "karpe wadi",
+    "jimmy baug", "jimmybaug", "jimmy bag", "jimmybag", "jimmi baug",
+    "hanuman wadi", "hanumanwadi",
+    "katemanivali", "kate manivali", "katemanevali", "katemaniwali", "katemanewali",
+    "chiknipada", "chikni pada",
+    "mhasoba chowk", "mhasoba",
 ]
 # Right around 2 km - only used when INCLUDE_BORDERLINE = True.
 BORDERLINE_LOCALITIES = [
-    "vijay nagar", "vijaynagar", "vijayanagar", "vijaya nagar",
     "amrai", "tisgaon", "tisgao", "netivali",
 ]
 # Kalyan East / nearby areas that are further than 2 km from the station.
 # (Roads such as Kalyan-Shil Road or Malang Road start next to the station,
 # so they are deliberately not listed here.)
 FAR_LOCALITIES = [
-    "katemanivali", "kate manivali", "chinchpada", "suchak naka",
+    "chinchpada", "suchak naka",
     "kailash nagar", "pisavli", "pisavali", "adivali", "dhokali",
-    "nandivli", "nandivali", "hanuman nagar",
-    "vithalwadi", "vitthalwadi", "ulhasnagar",
+    "nandivli", "nandivali",
+    "ulhasnagar",
     "ambernath", "badlapur", "dombivli", "dombivali", "thakurli", "titwala",
     "shahad", "mohone", "ambivli", "bhiwandi", "palava", "kalyan rural",
 ]
@@ -135,6 +154,7 @@ def _words_re(words):
 
 NEAR_RE = _words_re(NEAR_LOCALITIES)
 EXTENDED_RE = _words_re(EXTENDED_AREAS)
+LOOSE_RE = _words_re(LOOSE_AREAS)
 BORDER_RE = _words_re(BORDERLINE_LOCALITIES)
 FAR_RE = _words_re(FAR_LOCALITIES)
 WEST_RE = re.compile(
@@ -289,22 +309,27 @@ def send_telegram(text):
         print("Telegram secrets missing - message not sent.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.ok:
-            print("Telegram message sent.")
-            return True
-        # Telegram explains the problem in the response body - show it.
-        print(f"Telegram error {r.status_code}: {r.text}")
-    except Exception as e:
-        print(f"Telegram request failed: {e}")
-    return False
+    # TELEGRAM_CHAT_ID may hold several chats, comma separated
+    # (your own chat, a family group, or each family member's chat).
+    any_ok = False
+    for chat in [c.strip() for c in str(TELEGRAM_CHAT_ID).split(",") if c.strip()]:
+        payload = {
+            "chat_id": chat,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            if r.ok:
+                print("Telegram message sent.")
+                any_ok = True
+            else:
+                # Telegram explains the problem in the response body - show it.
+                print(f"Telegram error {r.status_code}: {r.text}")
+        except Exception as e:
+            print(f"Telegram request failed: {e}")
+    return any_ok
 
 
 # ------------------------------------------------------------------ address from pin
@@ -644,7 +669,7 @@ def check_location(headline, text, coords):
             verdict = full
     if verdict is None:
         return False, "unclear", "no locality"
-    if verdict[0] and EXTENDED_RE.search(verdict[2].lower()):
+    if verdict[0] and LOOSE_RE.search(verdict[2].lower()):
         # "Chakki Naka" is used loosely - drop it if the address is a far area
         far = FAR_RE.search(text)
         if far:
@@ -696,7 +721,8 @@ DETAIL_KEYS = {
     "tenants": ["leasetype", "tenanttype", "preferredtenants"],
     "parking": ["parking", "parkingdesc", "carparking"],
     "address": ["street", "address", "propertyaddress", "locality", "society"],
-    "posted": ["activationdate", "creationdate", "postedon", "createdon"],
+    "posted": ["activationdate", "creationdate", "postedon", "createdon", "dateposted",
+               "datepublished", "datecreated", "posteddate", "postdate", "createddate", "listeddate"],
 }
 ENUM_WORDS = {
     "both": "Bike + Car", "four_wheeler": "Car", "two_wheeler": "Bike only", "none": "None",
@@ -707,6 +733,13 @@ ENUM_WORDS = {
 
 
 def _fmt_date(v):
+    if isinstance(v, str):
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", v.strip())  # 2026-10-05 / 2026-10-05T10:00:00Z
+        if m:
+            try:
+                return datetime.date(*map(int, m.groups())).strftime("%d %b %Y")
+            except ValueError:
+                pass
     try:
         ms = float(v)
         if ms > 1e11:
@@ -1021,6 +1054,16 @@ def enrich_from_detail(session, item):
     m = re.search(r"(?:security\s+)?deposit\s*:?\s*((?:₹|rs\.?)\s?[\d,]+(?:\.\d+)?\s*(?:lac|lakh|k)?)", detail, re.I)
     if m and not d.get("deposit"):
         d["deposit"] = m.group(1).strip()
+    if not d.get("posted"):
+        m = re.search(r'"(?:datePosted|datePublished|postedOn|postedDate|createdDate|dateCreated)"'
+                      r'\s*:\s*"?([0-9T:\-\.+Z]{8,30})', r.text)
+        if m:
+            d["posted"] = _fmt_date(m.group(1) if not m.group(1).isdigit() else int(m.group(1)))
+        else:
+            m = re.search(r"\b(?:posted|listed)\s*(?:on)?\s*:?\s*(\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4}"
+                          r"|\d+\s+(?:days?|weeks?|months?)\s+ago|today|yesterday)", detail, re.I)
+            if m:
+                d["posted"] = m.group(1)
     label = brokerage_label(detail)
     if label:
         item["brokerage_override"] = label
@@ -1158,6 +1201,28 @@ def check_site(session, site, cfg, seen=None):
     return matches, status
 
 
+def _parse_shown_date(text):
+    try:
+        return datetime.datetime.strptime(text, "%d %b %Y").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _days_ago(text):
+    d = _parse_shown_date(text)
+    if not d:
+        return ""
+    n = (datetime.datetime.now(datetime.timezone.utc).date() - d).days
+    if n < 0:
+        return ""
+    return " (today)" if n == 0 else " (yesterday)" if n == 1 else f" ({n} days ago)"
+
+
+def _days_between(a, b):
+    da, db = _parse_shown_date(a), _parse_shown_date(b)
+    return abs((da - db).days) if da and db else 0
+
+
 def _money(v):
     v = str(v).strip()
     if v.replace(",", "").replace(".", "").isdigit():
@@ -1187,8 +1252,12 @@ def format_listing(item):
     when = []
     if d.get("available"):
         when.append(f"Available {d['available']}")
+    first = nobroker_posted(item["url"]) if item["site"] == "NoBroker" else ""
     if d.get("posted"):
-        when.append(f"Posted {d['posted']}")
+        posted = f"Ad posted {d['posted']}{_days_ago(d['posted'])}"
+        if first and first != d["posted"] and _days_between(first, d["posted"]) > 30:
+            posted += f" (first listed {first})"
+        when.append(posted)
 
     lines = [
         f"🏠 <b>{e((item['title'] or '1 BHK / 1 RK')[:120])}</b>",
@@ -1220,8 +1289,8 @@ def format_listing(item):
 
 def criteria_line():
     parts = [
-        f"Kalyan East · ≤{MAX_DISTANCE_KM:g} km from station "
-        f"(Lokgram, Kolsewadi, Tisgao Naka) + Chakki Naka ≤{EXTENDED_AREA_MAX_KM:g} km",
+        f"Kalyan East · ≤{MAX_DISTANCE_KM:g} km from station + Vijay Nagar, Katemanivali, "
+        f"Chakki Naka & other named areas ≤{EXTENDED_AREA_MAX_KM:g} km",
         "1BHK/1RK",
     ]
     if REQUIRE_CAR_PARKING:
