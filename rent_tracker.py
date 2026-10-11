@@ -110,6 +110,14 @@ def main():
             seen_listings.add(item["id"])
             alert_count += 1
 
+    # If no new matching properties were found, send an update message
+    if alert_count == 0:
+        status_message = (
+            "ℹ️ *Kalyan Rental Status Update*\n\n"
+            "Checked NoBroker just now. Currently, **no new properties** match your criteria (1 BHK/RK + Car Parking in Kalyan East station side) right now. Will check again in 6 hours!"
+        )
+        send_telegram_alert(status_message)
+
     save_seen_listings(seen_listings)
     print(f"Done! Sent {alert_count} new alerts.")
 
