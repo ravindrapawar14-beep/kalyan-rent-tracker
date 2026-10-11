@@ -1012,8 +1012,17 @@ def enrich_from_detail(session, item):
     label = brokerage_label(detail)
     if label:
         item["brokerage_override"] = label
+    # parking is often only in the page's hidden data, not in the visible text
+    raw = r.text
+    m = re.search(r'"(carParking|car_parking|coveredParking|openParking|reservedParking|parkingDesc|parking)"'
+                  r'\s*:\s*"?([^",}\]]{1,40})', raw, re.I)
+    if m:
+        item["text"] += f' PAGEDATA "{m.group(1).lower()}": "{m.group(2).strip()}"'
     p = re.search(r".{0,40}parking.{0,40}", detail, re.I)
-    item["parking_snippet"] = p.group(0) if p else "(no 'parking' on page)"
+    raw_hits = [re.sub(r"<[^>]+>|\s+", " ", raw[max(0, x.start() - 50):x.end() + 50]).strip()
+                for x in list(re.finditer(r"parking", raw, re.I))[:3]]
+    item["parking_snippet"] = ((p.group(0) if p else "(not in visible text)")
+                               + " || page data: " + (" | ".join(raw_hits)[:300] or "none"))
     return "ok"
 
 
@@ -1088,7 +1097,7 @@ def check_site(session, site, cfg, seen=None):
 
     if cfg.get("detail_check"):
         todo = [i for i in merged.values()
-                if not results[i["url"]][0] and f"DC|{i['url']}" not in seen
+                if not results[i["url"]][0] and f"DC2|{i['url']}" not in seen
                 and f"{site}|{i['url']}" not in seen and (
                     (results[i["url"]][1] == "parking" and i.get("parking_state") != "no")
                     or results[i["url"]][1] == "unclear")]
@@ -1099,8 +1108,9 @@ def check_site(session, site, cfg, seen=None):
             if status == "ok":
                 results[item["url"]] = evaluate(item)
                 ok, reason = results[item["url"]]
-                if not ok:
-                    seen.add(f"DC|{item['url']}")  # don't reopen this page every run
+                if not ok and (reason in ("far", "west", "size")
+                               or (reason == "parking" and item.get("parking_state") == "no")):
+                    seen.add(f"DC2|{item['url']}")  # page clearly rules it out: don't reopen
                 print(f"    detail page: {'MATCH' if ok else SKIP_REASONS[reason]} | parking text: "
                       f"{item.get('parking_snippet', '')!r} | {item['url']}")
             else:
