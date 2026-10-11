@@ -80,6 +80,11 @@ WHATSAPP_SEND_SUMMARY = False
 WHATSAPP_MAX_PER_RUN = 10     # new-listing messages per number per run
 WHATSAPP_WELCOME_MAX = 10     # a newly added number first gets this many current matches
 
+# 99acres / MagicBricks / Square Yards don't show parking (and often not the
+# locality) on their search pages, so the tracker opens the flat's own page
+# for nearby candidates. Max pages opened per site per run:
+DETAIL_FETCH_MAX = 15
+
 LISTINGS_PER_MESSAGE = 4  # detailed alerts are longer (Telegram max 4096 chars)
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
 
@@ -180,10 +185,17 @@ SITES = {
     },
     "99acres": {
         "urls": [
+            # owner-only (no brokerage) pages
+            "https://www.99acres.com/1-bhk-property-for-rent-in-lokgram-mumbai-beyond-thane-without-brokerage-ffid",
+            "https://www.99acres.com/1-bhk-property-for-rent-in-kolsewadi-mumbai-beyond-thane-without-brokerage-ffid",
+            "https://www.99acres.com/1-bhk-property-for-rent-in-kalyan-east-mumbai-beyond-thane-without-brokerage-ffid",
+            "https://www.99acres.com/1-rk-property-for-rent-in-kalyan-east-mumbai-beyond-thane-without-brokerage-ffid",
+            # all listings
             "https://www.99acres.com/1-bhk-flats-for-rent-in-kalyan-east-mumbai-beyond-thane-ffid",
             "https://www.99acres.com/flats-for-rent-in-kalyan-east-mumbai-beyond-thane-ffid",
         ],
         "link_pattern": r"(spid-|-r\d{6,}|-npxid-)",
+        "detail_check": True,
         "brokerage": "Owner or agent - check the listing",
         "contact": "phone button on the 99acres page",
     },
@@ -194,6 +206,7 @@ SITES = {
         ],
         "link_pattern": r"(propertyDetails|pdpid)",
         "must_match": r"(propertyDetails|pdpid)",
+        "detail_check": True,
         "brokerage": "Owner or agent - check the listing",
         "contact": "'Contact' button on the MagicBricks page",
     },
@@ -203,6 +216,7 @@ SITES = {
             "https://www.squareyards.com/rent/1-rk-for-rent-in-kalyan-thane",
         ],
         "link_pattern": r"/rent/.*\d{5,}",
+        "detail_check": True,
         "brokerage": "May be an agent - ask about brokerage",
         "contact": "'Contact' button on the Square Yards page",
     },
@@ -593,6 +607,7 @@ def evaluate(item):
 
     parking = check_parking(raw, text)
     item["parking"] = parking == "yes"
+    item["parking_state"] = parking
     if parking == "no" or (REQUIRE_CAR_PARKING and parking != "yes"):
         return False, "parking"
     return True, ""
@@ -868,8 +883,87 @@ def listings_from_links(soup, base_url, link_pattern):
     return list(found.values())
 
 
+# ------------------------------------------------------------------ detail pages
+def _walk_dicts(node, depth=6):
+    if depth < 0:
+        return
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk_dicts(v, depth - 1)
+    elif isinstance(node, list):
+        for v in node[:50]:
+            yield from _walk_dicts(v, depth - 1)
+
+
+def brokerage_label(text):
+    """Owner / agent / brokerage wording on the flat's own page."""
+    t = text.lower()
+    if re.search(r"\b(no|zero) brokerage\b|\bbrokerage\s*:?\s*(none|nil|zero|0|no|not applicable)\b", t):
+        return "No brokerage (as per listing)"
+    m = re.search(r"\bbrokerage\s*:?\s*((?:₹|rs\.?)\s?[\d,]+|[\d.]+\s*(?:month|months|days?))", t)
+    if m:
+        return f"Brokerage {m.group(1)} - confirm with the lister"
+    m = re.search(r"\b(?:posted|listed|added)\s+by\s*:?\s*(owner|dealer|agent|broker|builder)", t)
+    if m:
+        who = m.group(1)
+        return "Owner listing - no brokerage" if who == "owner" else f"Posted by {who} - brokerage may apply"
+    return ""
+
+
+def enrich_from_detail(session, item):
+    """Open the flat's own page and add its text, pin and owner/agent info."""
+    try:
+        r = session.get(item["url"], headers=HEADERS, timeout=25)
+    except Exception as e:
+        return f"failed ({e.__class__.__name__})"
+    if r.status_code != 200 or len(r.text) < 3000:
+        return f"HTTP {r.status_code}"
+    soup = BeautifulSoup(r.text, "html.parser")
+    blobs, _ = extract_json_blobs(soup, r.text)
+
+    # map pin: only if the page carries exactly one location (not similar flats)
+    if not item.get("coords"):
+        geos = set()
+        for b in blobs:
+            for node in _walk_dicts(b):
+                g = node.get("geo")
+                if isinstance(g, dict):
+                    try:
+                        lat, lng = float(g.get("latitude")), float(g.get("longitude"))
+                    except (TypeError, ValueError):
+                        continue
+                    if valid_coords(lat, lng):
+                        geos.add((round(lat, 5), round(lng, 5)))
+        if len(geos) == 1:
+            item["coords"] = geos.pop()
+
+    # the flat's own section: from the page heading onwards, before "similar" lists
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    h1 = soup.find("h1")
+    body = soup.get_text(" ", strip=True)
+    start = body.find(h1.get_text(" ", strip=True)) if h1 else -1
+    detail = body[max(start, 0):max(start, 0) + 6000]
+    cut = re.search(r"(similar|recommended|nearby) (properties|projects|listings)", detail, re.I)
+    if cut and cut.start() > 500:
+        detail = detail[:cut.start()]
+    item["text"] += " DETAIL: " + detail
+
+    d = item.setdefault("details", {})
+    m = re.search(r"(?:security\s+)?deposit\s*:?\s*((?:₹|rs\.?)\s?[\d,]+(?:\.\d+)?\s*(?:lac|lakh|k)?)", detail, re.I)
+    if m and not d.get("deposit"):
+        d["deposit"] = m.group(1).strip()
+    label = brokerage_label(detail)
+    if label:
+        item["brokerage_override"] = label
+    p = re.search(r".{0,40}parking.{0,40}", detail, re.I)
+    item["parking_snippet"] = p.group(0) if p else "(no 'parking' on page)"
+    return "ok"
+
+
 # ------------------------------------------------------------------ scraping
-def check_site(session, site, cfg):
+def check_site(session, site, cfg, seen=None):
     """Reads every page of a site. Returns (matches, status_text)."""
     merged, pages_ok, problems = {}, 0, []
     for n, url in enumerate(cfg["urls"]):
@@ -932,12 +1026,39 @@ def check_site(session, site, cfg):
         if c and pins[(round(c[0], 4), round(c[1], 4))] >= 3:
             item["coords"] = None
 
+    seen = seen if seen is not None else set()
+    results = {}
+    for item in merged.values():
+        results[item["url"]] = evaluate(item)
+
+    if cfg.get("detail_check"):
+        todo = [i for i in merged.values()
+                if not results[i["url"]][0] and f"DC|{i['url']}" not in seen
+                and f"{site}|{i['url']}" not in seen and (
+                    (results[i["url"]][1] == "parking" and i.get("parking_state") != "no")
+                    or results[i["url"]][1] == "unclear")]
+        todo.sort(key=lambda i: results[i["url"]][1] != "parking")  # location-ok ones first
+        for item in todo[:DETAIL_FETCH_MAX]:
+            time.sleep(2)
+            status = enrich_from_detail(session, item)
+            if status == "ok":
+                results[item["url"]] = evaluate(item)
+                ok, reason = results[item["url"]]
+                if not ok:
+                    seen.add(f"DC|{item['url']}")  # don't reopen this page every run
+                print(f"    detail page: {'MATCH' if ok else SKIP_REASONS[reason]} | parking text: "
+                      f"{item.get('parking_snippet', '')!r} | {item['url']}")
+            else:
+                print(f"    detail page {status}: {item['url']}")
+        if todo:
+            print(f"    detail pages opened: {min(len(todo), DETAIL_FETCH_MAX)} of {len(todo)} candidates")
+
     matches, skipped = [], Counter()
     for item in merged.values():
-        ok, reason = evaluate(item)
+        ok, reason = results[item["url"]]
         if ok:
             item["site"] = site
-            item["brokerage"] = cfg.get("brokerage", "")
+            item["brokerage"] = item.get("brokerage_override") or cfg.get("brokerage", "")
             item["contact"] = cfg.get("contact", "")
             matches.append(item)
         else:
@@ -1031,7 +1152,7 @@ def main():
 
     new_items, all_matches, summary = [], [], []
     for site, cfg in SITES.items():
-        matches, status = check_site(session, site, cfg)
+        matches, status = check_site(session, site, cfg, seen)
         all_matches.extend(matches)
         fresh = [m for m in matches if f"{site}|{m['url']}" not in seen and m["url"] not in seen]
         new_items.extend(fresh)
