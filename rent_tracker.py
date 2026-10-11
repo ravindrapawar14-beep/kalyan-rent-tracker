@@ -506,8 +506,8 @@ def normalize_url(url):
 
 
 DETAIL_KEYS = {
-    "deposit": ["deposit", "securitydeposit", "depositamount"],
-    "maintenance": ["maintenanceamount", "maintenancecharges", "maintenance"],
+    "deposit": ["deposit", "securitydeposit", "depositamount", "formatteddeposit"],
+    "maintenance": ["maintenanceamount", "formattedmaintenanceamount", "maintenancecharges", "maintenance"],
     "size": ["propertysize", "builtuparea", "carpetarea", "superbuiltuparea", "floorsize", "area"],
     "furnishing": ["furnishing", "furnishingdesc", "furnished"],
     "floor": ["floor", "floorno"],
@@ -544,10 +544,12 @@ def _fmt_value(key, v):
         v = first_value(v, ["value", "name", "displayName", "label"])
     if isinstance(v, str) and v.lower() in ENUM_WORDS:
         return ENUM_WORDS[v.lower()]
+    if isinstance(v, str) and re.fullmatch(r"[A-Z0-9_]+", v) and "_" in v:
+        return v.replace("_", " ").capitalize()  # e.g. BACHELOR_MALE -> Bachelor male
     if key in ("available", "posted"):
         return _fmt_date(v)
-    if key in ("deposit", "maintenance") and str(v).replace(".", "").isdigit():
-        return f"₹{float(v):,.0f}"
+    if key in ("deposit", "maintenance") and str(v).replace(",", "").replace(".", "").isdigit():
+        return f"₹{float(str(v).replace(',', '')):,.0f}"
     if key == "size" and str(v).replace(".", "").isdigit():
         return f"{float(v):,.0f} sqft"
     return str(v).strip()
@@ -560,6 +562,8 @@ def details_from_node(node):
     for field, keys in DETAIL_KEYS.items():
         for k in keys:
             v = lower.get(k)
+            if isinstance(v, bool):  # yes/no flags are not values to show
+                continue
             if v not in (None, "", [], {}):
                 val = _fmt_value(field, v)
                 if field == "size" and not re.search(r"\d", val):
@@ -844,6 +848,8 @@ def check_site(session, site, cfg):
                 print(f"    skip ({SKIP_REASONS[reason]}, {item.get('place', '')}): {item['url']}")
     for item in matches:
         print(f"    MATCH {item['title'][:60]!r} {item['price']} {item['place']} {item['url']}")
+    if matches:
+        print("    sample alert:\n      " + format_listing(matches[0]).replace("\n", "\n      "))
     print(f"    {len(merged)} listings from {pages_ok} pages, matching: {len(matches)}, skipped: {dict(skipped)}")
 
     status = f"{len(merged)} listings read ({pages_ok} pages), {len(matches)} match"
