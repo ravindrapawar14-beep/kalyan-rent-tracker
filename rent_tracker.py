@@ -6,7 +6,9 @@ passes ALL of these checks:
 
   1. 1 BHK or 1 RK only (1.5 / 2 / 3 BHK are dropped)
   2. Kalyan East only - anything that says Kalyan West is dropped
-  3. Within 2 km of Kalyan railway station (east entry), e.g. Lokgram, Kolsewadi
+  3. Within 2 km of Kalyan railway station (east entry) - Lokgram, Kolsewadi /
+     Shivaji Colony, Tisgao Naka / Santosh Nagar - plus Chakki Naka, which
+     sits a little further out and is accepted up to 3 km on the map.
   4. Four-wheeler (car) parking clearly mentioned - "no car parking",
      "two-wheeler only" or no mention at all is dropped
 
@@ -18,11 +20,17 @@ How the 2 km check works:
   * Otherwise the listing must name a locality from NEAR_LOCALITIES.
   * No map pin and no known nearby locality = skipped as "location unclear".
 
+Each Telegram alert carries the rent, deposit, maintenance, size, furnishing,
+floor, parking type, availability and posting date (whatever the site shows),
+whether it is an owner listing (no brokerage), how to contact, and the link.
+
 The summary message after each run shows how many listings were read on each
 site and why the rest were skipped, so you can see the filter working.
 Runs on GitHub Actions every 6 hours. (Housing.com is not included: it blocks
 automated visits.)
 """
+import copy
+import datetime
 import html
 import json
 import math
@@ -43,6 +51,10 @@ STATE_FILE = "seen_listings.json"
 # Kalyan Junction railway station, east entry (lat, lng)
 STATION = (19.234802, 73.131218)
 MAX_DISTANCE_KM = 2.0
+# Areas you asked for that sit a little beyond 2 km: listings naming them may
+# be up to EXTENDED_AREA_MAX_KM away on the map.
+EXTENDED_AREAS = ["chakki naka", "chakkinaka"]
+EXTENDED_AREA_MAX_KM = 3.0
 
 # True = only listings that clearly mention car / four-wheeler parking.
 REQUIRE_CAR_PARKING = True
@@ -54,26 +66,31 @@ INCLUDE_BORDERLINE = False
 # Send a short "what was checked" summary after every run.
 SEND_SUMMARY_EVERY_RUN = True
 
-LISTINGS_PER_MESSAGE = 8
+LISTINGS_PER_MESSAGE = 4  # detailed alerts are longer (Telegram max 4096 chars)
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
 
 # ------------------------------------------------------------------ areas
 # Kalyan East localities inside the 2 km zone (used when there is no map pin).
 NEAR_LOCALITIES = [
-    "lokgram", "lok gram",
+    "lokgram", "lok gram", "atmaram nagar",
     "kolsewadi", "kolshewadi", "kolsevadi", "kolse wadi", "kolshe wadi",
+    "shivaji colony", "prabhuram nagar",
+    "tisgao naka", "tisgaon naka", "santosh nagar",
+    "chakki naka", "chakkinaka",
 ]
 # Right around 2 km - only used when INCLUDE_BORDERLINE = True.
 BORDERLINE_LOCALITIES = [
     "vijay nagar", "vijaynagar", "vijayanagar", "vijaya nagar",
-    "amrai", "tisgaon", "tisgao",
+    "amrai", "tisgaon", "tisgao", "netivali",
 ]
 # Kalyan East / nearby areas that are further than 2 km from the station.
+# (Roads such as Kalyan-Shil Road or Malang Road start next to the station,
+# so they are deliberately not listed here.)
 FAR_LOCALITIES = [
-    "katemanivali", "kate manivali", "chinchpada", "chakki naka", "suchak naka",
-    "kailash nagar", "netivali", "pisavli", "pisavali", "adivali", "dhokali",
-    "nandivli", "nandivali", "hanuman nagar", "malang road", "kalyan shil road",
-    "shil phata", "shilphata", "vithalwadi", "vitthalwadi", "ulhasnagar",
+    "katemanivali", "kate manivali", "chinchpada", "suchak naka",
+    "kailash nagar", "pisavli", "pisavali", "adivali", "dhokali",
+    "nandivli", "nandivali", "hanuman nagar",
+    "vithalwadi", "vitthalwadi", "ulhasnagar",
     "ambernath", "badlapur", "dombivli", "dombivali", "thakurli", "titwala",
     "shahad", "mohone", "ambivli", "bhiwandi", "palava", "kalyan rural",
 ]
@@ -90,6 +107,7 @@ def _words_re(words):
 
 
 NEAR_RE = _words_re(NEAR_LOCALITIES)
+EXTENDED_RE = _words_re(EXTENDED_AREAS)
 BORDER_RE = _words_re(BORDERLINE_LOCALITIES)
 FAR_RE = _words_re(FAR_LOCALITIES)
 WEST_RE = re.compile(
@@ -130,11 +148,21 @@ JSON_CAR_FIELD_RE = re.compile(
 SITES = {
     "NoBroker": {
         "urls": [
+            "https://www.nobroker.in/1bhk-flats-for-rent-in-lokgram_kalyan_mumbai",
+            "https://www.nobroker.in/1rk-flats-for-rent-in-lokgram_kalyan_mumbai",
+            "https://www.nobroker.in/1bhk-flats-for-rent-in-shivaji_colony_kalyan_mumbai",
+            "https://www.nobroker.in/1rk-flats-for-rent-in-shivaji_colony_kalyan_mumbai",
+            "https://www.nobroker.in/flats-for-rent-in-kolsewadi_kalyan_east_kalyan_mumbai",
+            "https://www.nobroker.in/1bhk-flats-for-rent-in-santosh_nagar_kalyan_mumbai",
+            "https://www.nobroker.in/1bhk-flats-for-rent-near-chakki_naka_mumbai",
+            "https://www.nobroker.in/1bhk-flats-for-rent-in-vijay_nagar_kalyan_mumbai",
             "https://www.nobroker.in/1bhk-flats-for-rent-in-kalyan_east_mumbai",
             "https://www.nobroker.in/flats-for-rent-in-kalyan_east_mumbai",
         ],
         "link_pattern": r"/property/",
         "must_match": r"/property/.+/detail",  # skips search-result pages
+        "brokerage": "Owner listing - no brokerage",
+        "contact": "tap 'Contact Owner' on the NoBroker page (free login)",
     },
     "99acres": {
         "urls": [
@@ -142,6 +170,8 @@ SITES = {
             "https://www.99acres.com/flats-for-rent-in-kalyan-east-mumbai-beyond-thane-ffid",
         ],
         "link_pattern": r"(spid-|-r\d{6,}|-npxid-)",
+        "brokerage": "Owner or agent - check the listing",
+        "contact": "phone button on the 99acres page",
     },
     "MagicBricks": {
         "urls": [
@@ -150,12 +180,17 @@ SITES = {
         ],
         "link_pattern": r"(propertyDetails|pdpid)",
         "must_match": r"(propertyDetails|pdpid)",
+        "brokerage": "Owner or agent - check the listing",
+        "contact": "'Contact' button on the MagicBricks page",
     },
     "Square Yards": {
         "urls": [
             "https://www.squareyards.com/rent/property-for-rent-in-kalyan-east-thane",
+            "https://www.squareyards.com/rent/1-rk-for-rent-in-kalyan-thane",
         ],
         "link_pattern": r"/rent/.*\d{5,}",
+        "brokerage": "May be an agent - ask about brokerage",
+        "contact": "'Contact' button on the Square Yards page",
     },
 }
 
@@ -186,7 +221,7 @@ LNG_KEYS = {"longitude", "lng", "lon", "long", "geolng", "geolon", "maplng", "ma
 SKIP_REASONS = {
     "size": "not 1BHK/1RK",
     "west": "Kalyan West",
-    "far": "beyond 2 km",
+    "far": "too far",
     "border": "~2 km borderline",
     "unclear": "location unclear",
     "parking": "no car parking",
@@ -409,7 +444,9 @@ def check_location(headline, text, coords):
     if coords:
         dist = distance_km(STATION, coords)
         side = side_of_tracks(coords)
-        if dist > MAX_DISTANCE_KM:
+        extended = EXTENDED_RE.search(headline) or EXTENDED_RE.search(text)
+        limit = EXTENDED_AREA_MAX_KM if extended else MAX_DISTANCE_KM
+        if dist > limit:
             return False, "far", f"{dist:.1f} km"
         # Title/link naming a far-off or West area beats a wrong map pin
         # (e.g. "Flat in Badlapur" pinned next to Kalyan station).
@@ -424,11 +461,21 @@ def check_location(headline, text, coords):
         label = f"{name.group(1).title()} · " if name else ""
         return True, "", f"{label}{dist:.1f} km from station (map pin)"
     # no map pin -> the title/link decides first, then the full text
-    for scope in (headline, text):
-        verdict = _area_verdict(scope)
-        if verdict:
-            return verdict
-    return False, "unclear", "no locality"
+    head = _area_verdict(headline)
+    full = _area_verdict(text)
+    verdict = head
+    if head is None or head[1] in ("border", "unclear"):
+        # title is vague (e.g. "Omkar Nagar Netivali") - let the address decide
+        if full and (full[0] or head is None):
+            verdict = full
+    if verdict is None:
+        return False, "unclear", "no locality"
+    if verdict[0] and EXTENDED_RE.search(verdict[2].lower()):
+        # "Chakki Naka" is used loosely - drop it if the address is a far area
+        far = FAR_RE.search(text)
+        if far:
+            return False, "far", f"{verdict[2]} listing in {far.group(1)}"
+    return verdict
 
 
 def evaluate(item):
@@ -456,6 +503,84 @@ def evaluate(item):
 # ------------------------------------------------------------------ page parsing
 def normalize_url(url):
     return url.split("#")[0].split("?")[0].rstrip("/")
+
+
+DETAIL_KEYS = {
+    "deposit": ["deposit", "securitydeposit", "depositamount"],
+    "maintenance": ["maintenanceamount", "maintenancecharges", "maintenance"],
+    "size": ["propertysize", "builtuparea", "carpetarea", "superbuiltuparea", "floorsize", "area"],
+    "furnishing": ["furnishing", "furnishingdesc", "furnished"],
+    "floor": ["floor", "floorno"],
+    "total_floors": ["totalfloor", "totalfloors"],
+    "available": ["availablefrom", "possessiondate", "availabledate", "availability"],
+    "tenants": ["leasetype", "tenanttype", "preferredtenants"],
+    "parking": ["parking", "parkingdesc", "carparking"],
+    "address": ["street", "address", "propertyaddress", "locality", "society"],
+    "posted": ["activationdate", "creationdate", "postedon", "createdon"],
+}
+ENUM_WORDS = {
+    "both": "Bike + Car", "four_wheeler": "Car", "two_wheeler": "Bike only", "none": "None",
+    "semi_furnished": "Semi furnished", "full_furnished": "Fully furnished",
+    "fully_furnished": "Fully furnished", "not_furnished": "Unfurnished",
+    "family": "Family", "bachelor": "Bachelor", "company": "Company", "anyone": "Anyone",
+}
+
+
+def _fmt_date(v):
+    try:
+        ms = float(v)
+        if ms > 1e11:
+            ms /= 1000
+        d = datetime.datetime.fromtimestamp(ms, datetime.timezone.utc)
+        if 2010 < d.year < 2035:
+            return d.strftime("%d %b %Y")
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return str(v)
+
+
+def _fmt_value(key, v):
+    if isinstance(v, dict):
+        v = first_value(v, ["value", "name", "displayName", "label"])
+    if isinstance(v, str) and v.lower() in ENUM_WORDS:
+        return ENUM_WORDS[v.lower()]
+    if key in ("available", "posted"):
+        return _fmt_date(v)
+    if key in ("deposit", "maintenance") and str(v).replace(".", "").isdigit():
+        return f"₹{float(v):,.0f}"
+    if key == "size" and str(v).replace(".", "").isdigit():
+        return f"{float(v):,.0f} sqft"
+    return str(v).strip()
+
+
+def details_from_node(node):
+    """Rent details that the site's page data carries (keys vary by site)."""
+    lower = {k.lower(): v for k, v in node.items() if isinstance(k, str)}
+    out = {}
+    for field, keys in DETAIL_KEYS.items():
+        for k in keys:
+            v = lower.get(k)
+            if v not in (None, "", [], {}):
+                val = _fmt_value(field, v)
+                if field == "size" and not re.search(r"\d", val):
+                    continue
+                if (val and val.lower() not in ("null", "none", "0")) or field == "maintenance":
+                    out[field] = val
+                    break
+    return out
+
+
+def nobroker_posted(url):
+    """NoBroker listing ids carry the date the listing was first posted."""
+    m = re.search(r"/([0-9a-f]{32})/detail", url)
+    if m:
+        try:
+            d = datetime.datetime.fromtimestamp(int(m.group(1)[16:28], 16) / 1000, datetime.timezone.utc)
+            if 2014 < d.year < 2035:
+                return d.strftime("%d %b %Y")
+        except (ValueError, OverflowError, OSError):
+            pass
+    return ""
 
 
 def first_value(d, keys):
@@ -570,6 +695,8 @@ def listings_from_json(blobs, base_url, link_pattern):
                         "price": price,
                         "url": full,
                         "coords": coords_from_node(node),
+                        "details": details_from_node(node),
+                        "keys": sorted(node.keys())[:80],
                         "text": json.dumps(compact(node), ensure_ascii=False)[:10000] + " " + full,
                     }
             for v in node.values():
@@ -618,6 +745,12 @@ def listings_from_links(soup, base_url, link_pattern):
             card = parent
             if len(card.get_text(" ", strip=True)) > 250:
                 break
+        # leave out other links inside the card (e.g. NoBroker's "Nearby:
+        # Dombivali Station, Wayle Nagar..." chips) - they are not the flat's area
+        card = copy.copy(card)
+        for x in card.find_all("a", href=True):
+            if normalize_url(urljoin(base_url, x["href"])) != key:
+                x.decompose()
         text = card.get_text(" ", strip=True)[:1500]
         price = ""
         m = re.search(r"₹\s?[\d,\.]+\s*(?:k|lac|lakh|/month)?", text, re.I)
@@ -635,96 +768,149 @@ def listings_from_links(soup, base_url, link_pattern):
 
 # ------------------------------------------------------------------ scraping
 def check_site(session, site, cfg):
-    """Returns (matches, status_text)."""
-    last_problem = "no page loaded"
-    for url in cfg["urls"]:
+    """Reads every page of a site. Returns (matches, status_text)."""
+    merged, pages_ok, problems = {}, 0, []
+    for n, url in enumerate(cfg["urls"]):
+        if n:
+            time.sleep(2)  # be polite between pages
         try:
             r = session.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
         except Exception as e:
             print(f"[{site}] {url} -> request failed: {e}")
-            last_problem = "could not connect"
+            problems.append("could not connect")
             continue
 
         soup = BeautifulSoup(r.text, "html.parser")
         title = soup.title.get_text(strip=True)[:80] if soup.title else ""
         print(f"[{site}] {url}")
-        print(f"    HTTP {r.status_code}, {len(r.text)} bytes, final URL: {r.url}")
-        print(f"    page title: {title!r}")
+        print(f"    HTTP {r.status_code}, {len(r.text)} bytes, page title: {title!r}")
 
         if r.status_code in (401, 403, 429):
-            last_problem = f"blocked automated access (HTTP {r.status_code})"
+            problems.append(f"blocked automated access (HTTP {r.status_code})")
             continue
         if r.status_code != 200:
-            last_problem = f"HTTP {r.status_code}"
+            problems.append(f"HTTP {r.status_code}")
             continue
 
         blobs, names = extract_json_blobs(soup, r.text)
         from_json = listings_from_json(blobs, r.url, cfg["link_pattern"])
         from_links = listings_from_links(soup, r.url, cfg["link_pattern"])
-        print(f"    embedded data: {names[:8]}")
         print(f"    listings found: {len(from_json)} from page data, {len(from_links)} from links")
 
-        merged = {item["url"]: item for item in from_links}
+        page = {item["url"]: item for item in from_links}
         for item in from_json:  # page data is richer, prefer it
-            if item["url"] in merged:
-                item["text"] += " " + merged[item["url"]]["text"]
-                item["title"] = item["title"] or merged[item["url"]]["title"]
-                item["price"] = item["price"] or merged[item["url"]]["price"]
-            merged[item["url"]] = item
+            if item["url"] in page:
+                item["text"] += " " + page[item["url"]]["text"]
+                item["title"] = item["title"] or page[item["url"]]["title"]
+                item["price"] = item["price"] or page[item["url"]]["price"]
+            page[item["url"]] = item
         if cfg.get("must_match"):
-            merged = {u: i for u, i in merged.items() if re.search(cfg["must_match"], u)}
+            page = {u: i for u, i in page.items() if re.search(cfg["must_match"], u)}
+        if page:
+            pages_ok += 1
+        elif "captcha" in r.text.lower() or "access denied" in r.text[:3000].lower():
+            problems.append("blocked automated access (captcha page)")
+        for u, item in page.items():
+            merged.setdefault(u, item)
 
-        # The same pin on 3+ listings is a locality centre, not the flat - ignore it.
-        pins = Counter(
-            (round(i["coords"][0], 4), round(i["coords"][1], 4))
-            for i in merged.values() if i.get("coords")
-        )
-        for item in merged.values():
-            c = item.get("coords")
-            if c and pins[(round(c[0], 4), round(c[1], 4))] >= 3:
-                item["coords"] = None
+    if not merged:
+        return [], (problems[-1] if problems else "page loaded but no listings could be read")
 
-        matches, skipped = [], Counter()
-        for item in merged.values():
-            ok, reason = evaluate(item)
-            if ok:
-                item["site"] = site
-                matches.append(item)
-            else:
-                skipped[reason] += 1
-                if sum(skipped.values()) <= 5:
-                    print(f"    skip ({SKIP_REASONS[reason]}, {item.get('place', '')}): {item['url']}")
-        for item in matches[:10]:
-            print(f"    MATCH {item['title'][:60]!r} {item['price']} {item['place']} {item['url']}")
-        print(f"    matching your criteria: {len(matches)}  skipped: {dict(skipped)}")
+    sample = next((i for i in merged.values() if i.get("keys")), None)
+    if sample:
+        print(f"    page-data fields (sample): {sample['keys']}")
 
-        if merged:
-            status = f"{len(merged)} listings read, {len(matches)} match"
-            if skipped:
-                status += " (skipped: " + ", ".join(
-                    f"{n} {SKIP_REASONS[k]}" for k, n in skipped.most_common()
-                ) + ")"
-            return matches, status
-        if "captcha" in r.text.lower() or "access denied" in r.text[:3000].lower():
-            last_problem = "blocked automated access (captcha page)"
+    # The same pin on 3+ listings is a locality centre, not the flat - ignore it.
+    pins = Counter(
+        (round(i["coords"][0], 4), round(i["coords"][1], 4))
+        for i in merged.values() if i.get("coords")
+    )
+    for item in merged.values():
+        c = item.get("coords")
+        if c and pins[(round(c[0], 4), round(c[1], 4))] >= 3:
+            item["coords"] = None
+
+    matches, skipped = [], Counter()
+    for item in merged.values():
+        ok, reason = evaluate(item)
+        if ok:
+            item["site"] = site
+            item["brokerage"] = cfg.get("brokerage", "")
+            item["contact"] = cfg.get("contact", "")
+            matches.append(item)
         else:
-            last_problem = "page loaded but no listings could be read"
-    return [], last_problem
+            skipped[reason] += 1
+            if skipped[reason] <= 3:
+                print(f"    skip ({SKIP_REASONS[reason]}, {item.get('place', '')}): {item['url']}")
+    for item in matches:
+        print(f"    MATCH {item['title'][:60]!r} {item['price']} {item['place']} {item['url']}")
+    print(f"    {len(merged)} listings from {pages_ok} pages, matching: {len(matches)}, skipped: {dict(skipped)}")
+
+    status = f"{len(merged)} listings read ({pages_ok} pages), {len(matches)} match"
+    if skipped:
+        status += " (skipped: " + ", ".join(
+            f"{n} {SKIP_REASONS[k]}" for k, n in skipped.most_common()
+        ) + ")"
+    return matches, status
+
+
+def _money(v):
+    v = str(v).strip()
+    if v.replace(",", "").replace(".", "").isdigit():
+        return f"₹{float(v.replace(',', '')):,.0f}"
+    return v
 
 
 def format_listing(item):
-    title = html.escape(item["title"] or "1 BHK / 1 RK")
-    price = html.escape(item["price"]) if item["price"] else "price not shown"
-    return (
-        f"🏠 <b>{title}</b>\n"
-        f"💰 {price} · 🚗 car parking\n"
-        f"📍 {html.escape(item.get('place') or 'Kalyan East')}\n"
-        f"🔗 <a href=\"{html.escape(item['url'])}\">Open on {html.escape(item['site'])}</a>"
-    )
+    e = html.escape
+    d = dict(item.get("details") or {})
+    if not d.get("posted") and item["site"] == "NoBroker":
+        d["posted"] = nobroker_posted(item["url"])
+
+    money = [f"{_money(item['price'])}/month" if item["price"] else "rent not shown"]
+    if d.get("deposit"):
+        money.append(f"Deposit {d['deposit']}")
+    if d.get("maintenance"):
+        maint = d["maintenance"]
+        money.append("No maintenance" if maint in ("0", "₹0") else f"Maint. {maint}")
+
+    flat = [x for x in (d.get("size"), d.get("furnishing")) if x]
+    if d.get("floor"):
+        flat.append(f"Floor {d['floor']}" + (f"/{d['total_floors']}" if d.get("total_floors") else ""))
+    if d.get("tenants"):
+        flat.append(f"For {d['tenants']}")
+
+    when = []
+    if d.get("available"):
+        when.append(f"Available {d['available']}")
+    if d.get("posted"):
+        when.append(f"Posted {d['posted']}")
+
+    lines = [
+        f"🏠 <b>{e((item['title'] or '1 BHK / 1 RK')[:120])}</b>",
+        "💰 " + e(" · ".join(money)),
+    ]
+    if flat:
+        lines.append("📐 " + e(" · ".join(flat)))
+    lines.append("🚗 " + e(d.get("parking") or "Car parking mentioned"))
+    lines.append("📍 " + e(item.get("place") or "Kalyan East")
+                 + (f" · {e(d['address'][:80])}" if d.get("address") else ""))
+    if when:
+        lines.append("🗓 " + e(" · ".join(when)))
+    if item.get("brokerage"):
+        lines.append("👤 " + e(item["brokerage"]))
+    if item.get("contact"):
+        lines.append("📞 Contact: " + e(item["contact"]))
+    lines.append(f"🔗 <a href=\"{e(item['url'])}\">Open on {e(item['site'])}</a>")
+    return "\n".join(lines)
 
 
 def criteria_line():
-    parts = [f"Kalyan East · ≤{MAX_DISTANCE_KM:g} km from station", "1BHK/1RK"]
+    parts = [
+        f"Kalyan East · ≤{MAX_DISTANCE_KM:g} km from station "
+        f"(Lokgram, Kolsewadi, Tisgao Naka) + Chakki Naka ≤{EXTENDED_AREA_MAX_KM:g} km",
+        "1BHK/1RK",
+    ]
     if REQUIRE_CAR_PARKING:
         parts.append("4-wheeler parking")
     return " · ".join(parts)
