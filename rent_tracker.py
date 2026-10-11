@@ -81,7 +81,7 @@ FAR_LOCALITIES = [
 WEST_LOCALITIES = [
     "khadakpada", "birla college", "godrej hill", "adharwadi", "durgadi",
     "wayle nagar", "gandhare", "gandhari", "barave", "rambaug", "ram baug",
-    "santoshi mata road", "agra road", "chikanghar", "bail bazar",
+    "santoshi mata road", "agra road", "chikanghar", "bail bazar", "subhash road",
 ]
 
 
@@ -411,6 +411,11 @@ def check_location(headline, text, coords):
         side = side_of_tracks(coords)
         if dist > MAX_DISTANCE_KM:
             return False, "far", f"{dist:.1f} km"
+        # Title/link naming a far-off or West area beats a wrong map pin
+        # (e.g. "Flat in Badlapur" pinned next to Kalyan station).
+        head = _area_verdict(headline)
+        if head and head[1] in ("far", "west"):
+            return False, head[1], f"{head[2]} (pin said {dist:.1f} km)"
         if side == "west" or (WEST_RE.search(headline) and not NEAR_RE.search(headline)):
             return False, "west", f"{dist:.1f} km, west side"
         if side == "unclear" and not (EAST_RE.search(text) or NEAR_RE.search(text)):
@@ -689,7 +694,7 @@ def check_site(session, site, cfg):
                 skipped[reason] += 1
                 if sum(skipped.values()) <= 5:
                     print(f"    skip ({SKIP_REASONS[reason]}, {item.get('place', '')}): {item['url']}")
-        for item in matches[:3]:
+        for item in matches[:10]:
             print(f"    MATCH {item['title'][:60]!r} {item['price']} {item['place']} {item['url']}")
         print(f"    matching your criteria: {len(matches)}  skipped: {dict(skipped)}")
 
