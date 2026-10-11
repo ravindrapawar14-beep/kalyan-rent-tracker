@@ -5,6 +5,11 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
+# Only one run at a time, so a scheduled run and a manual run never push over each other
+concurrency:
+  group: kalyan-rent-tracker
+  cancel-in-progress: false
+
 jobs:
   track-rentals:
     runs-on: ubuntu-latest
@@ -14,6 +19,9 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: main          # always start from the latest main, even on re-runs
+          fetch-depth: 0     # full history so pull --rebase works cleanly
 
       - name: Install Tools
         run: |
@@ -24,14 +32,32 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python3 rent_tracker.py
+        run: python3 rent_tracker.py
 
       - name: Commit and Push State Safely
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add seen_listings.json
-          git diff --staged --quiet || git commit -m "Update seen rentals state [skip ci]"
-          git pull --rebase origin main
-          git push origin main
+          if git diff --staged --quiet; then
+            echo "seen_listings.json unchanged - nothing to push."
+            exit 0
+          fi
+          git commit -m "Update seen rentals state [skip ci]"
+
+          # If main moved while the script was running (e.g. you edited a file),
+          # replay our commit on top of it and retry. -X theirs keeps this run's
+          # seen_listings.json if both sides changed it.
+          for attempt in 1 2 3; do
+            if git pull --rebase -X theirs origin main && git push origin HEAD:main; then
+              echo "State pushed successfully."
+              exit 0
+            fi
+            echo "Push attempt $attempt failed, retrying in 5s..."
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+
+          echo "Could not push after 3 attempts."
+          exit 1
