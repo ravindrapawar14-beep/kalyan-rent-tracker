@@ -89,6 +89,10 @@ DETAIL_FETCH_MAX = 15
 # from the pin (OpenStreetMap, free) and add a map link to the alert.
 FILL_ADDRESS_FROM_PIN = True
 
+# Some sites (e.g. Square Yards) say "1 dedicated parking spot" without saying
+# car or bike. True = send these, marked "confirm it is a car spot".
+ACCEPT_PARKING_SPOT = True
+
 LISTINGS_PER_MESSAGE = 4  # detailed alerts are longer (Telegram max 4096 chars)
 MAX_MESSAGES_PER_RUN = 6  # anything beyond this is sent on the next run
 
@@ -160,6 +164,11 @@ NO_CAR_PARKING_RE = re.compile(
     rf"|no\b|none\b|nil\b|na\b|n/a|0\b)"
     r"|\bonly\s+(?:two|2)\s*wheeler|\b(?:two|2)\s*wheeler\s+(?:parking\s+)?only"
     r"|\bbike\s+parking\s+only|\bonly\s+bike\s+parking"
+)
+SPOT_RE = re.compile(
+    r"\b(?:\d+|one|a|dedicated|designated|reserved|allotted|assigned|covered|open)\s+"
+    r"(?:dedicated\s+|designated\s+|reserved\s+|allotted\s+|covered\s+|open\s+)?"
+    r"parking\s+(?:spot|space|slot)s?\b"
 )
 # NoBroker page data: "parking": "BOTH" / "FOUR_WHEELER" / "TWO_WHEELER" / "NONE"
 NB_PARKING_RE = re.compile(r'"parking"\s*:\s*"(both|four_wheeler|two_wheeler|none)"')
@@ -661,9 +670,12 @@ def evaluate(item):
         return False, reason
 
     parking = check_parking(raw, text)
-    item["parking"] = parking == "yes"
+    if parking == "unknown" and ACCEPT_PARKING_SPOT and SPOT_RE.search(text):
+        parking = "spot"
+        item["parking_label"] = "Parking spot included (car or bike not stated - please confirm)"
+    item["parking"] = parking in ("yes", "spot")
     item["parking_state"] = parking
-    if parking == "no" or (REQUIRE_CAR_PARKING and parking != "yes"):
+    if parking == "no" or (REQUIRE_CAR_PARKING and parking not in ("yes", "spot")):
         return False, "parking"
     return True, ""
 
@@ -1021,6 +1033,8 @@ def enrich_from_detail(session, item):
     p = re.search(r".{0,40}parking.{0,40}", detail, re.I)
     raw_hits = [re.sub(r"<[^>]+>|\s+", " ", raw[max(0, x.start() - 50):x.end() + 50]).strip()
                 for x in list(re.finditer(r"parking", raw, re.I))[:3]]
+    if raw_hits:  # e.g. the listing description in the page data
+        item["text"] += " PAGEDATA_PARKING: " + raw_hits[0]
     item["parking_snippet"] = ((p.group(0) if p else "(not in visible text)")
                                + " || page data: " + (" | ".join(raw_hits)[:300] or "none"))
     return "ok"
@@ -1182,7 +1196,7 @@ def format_listing(item):
     ]
     if flat:
         lines.append("📐 " + e(" · ".join(flat)))
-    lines.append("🚗 " + e(d.get("parking") or "Car parking mentioned"))
+    lines.append("🚗 " + e(item.get("parking_label") or d.get("parking") or "Car parking mentioned"))
     loc = e(item.get("place") or "Kalyan East")
     if d.get("address"):
         loc += f" · {e(d['address'][:80])}"
