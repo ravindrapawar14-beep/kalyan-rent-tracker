@@ -27,6 +27,12 @@ jobs:
         run: |
           python3 rent_tracker.py
 
+      - name: Pull Remote Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull origin main --rebase || true
+
       - name: Save State
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
